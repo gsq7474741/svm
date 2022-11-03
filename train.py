@@ -12,15 +12,19 @@ key = jax.random.PRNGKey(0)
 if __name__ == '__main__':
     # x = jnp.array([[3, 3], [4, 3], [1, 1]])
     # y = jnp.array([1, 1, -1])
-    x = 2*(jnp.linspace(0, 10, 100))+2
-    x.at[50:].set(x[50:]+3)
-    y = jnp.concatenate([jnp.ones(50), -jnp.ones(50)])
+    data_len = 20
+    x = 2 * (jnp.linspace(0, 10, data_len)) + 2 + jax.random.uniform(key, (data_len,), 'float32', -0.1, 0.1)
+    x.at[10:].set(x[10:] + 3)
+    # x.at[:].set(x[:])
+    # for i in range(100):
+    #     x.at[i].set(x[i]+jax.random.uniform())
+    y = jnp.concatenate([jnp.ones(data_len//2), -jnp.ones(data_len//2)])
     kernel = kernels.KERNELS['linear']
     c = 1
     tol = 1e-3
     max_passes = 10
 
-    alpha = jax.random.uniform(key, (100,), minval=-1, maxval=1)
+    alpha = jax.random.uniform(key, (data_len,), minval=-1, maxval=1)
     b = model.calculate_b(alpha, x, y, kernel, c)
     print(f'b:{b}')
 

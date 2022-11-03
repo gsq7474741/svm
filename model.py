@@ -89,19 +89,20 @@ def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
     """
     n = x_.shape[0]
     alpha = jnp.zeros(n)
-    b = 0
+    b = 0.
     passes = 0
 
     def pass_it(*args):
         pass
 
-    def print_eta_le_0():
-        print('WARNING  eta <= 0')
+    def print_eta_le_0(i, n, alpha, b, passes, num_changed_alphas):
+        jax.debug.print('\033[1;031m WARNING  eta <= 0')
+        return i, n, alpha, b, passes, num_changed_alphas
 
     def print_delta_too_small(delta):
-        print(f'WARNING   a_j update too small, delta = {delta}')
+        jax.debug.print('\033[1;031m WARNING   a_j update too small, delta = {}', delta)
 
-    def loop_body(n, alpha, b, passes):
+    def while_loop_body(n, alpha, b, passes):
         num_changed_alphas = 0
 
         # for i in range(n):
@@ -128,68 +129,76 @@ def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
                   kernel_map(x_[j], x_[j], kernel) - \
                   2 * kernel_map(x_[i], x_[j], kernel)
 
-            # eta_le_0 = 'WARNING  eta <= 0'
-            cond(eta <= 0, print_eta_le_0, pass_it)
+            def if_brunch(i, n, alpha, b, passes, num_changed_alphas):
+                a_i_old, a_j_old = alpha[i], alpha[j]
+
+                L, H = cond(y_[i] == y_[j], lambda a_j_old, a_i_old, c: (
+                    jnp.maximum(0, a_j_old + a_i_old - c), jnp.minimum(c, a_j_old + a_i_old)),
+                            lambda a_j_old, a_i_old, c: (
+                                jnp.maximum(0, a_j_old - a_i_old), jnp.minimum(c, c + a_j_old - a_i_old)), a_j_old,
+                            a_i_old, c)
+
+                # if y_[i] == y_[j]:
+                #     L = jnp.maximum(0, a_j_old + a_i_old - c)
+                #     H = jnp.minimum(c, a_j_old + a_i_old)
+                # else:
+                #     L = jnp.maximum(0, a_j_old - a_i_old)
+                #     H = jnp.minimum(c, c + a_j_old - a_i_old)
+
+                a_j_new = jnp.clip(a_j_old + y_[j] * (E_i - E_j) / eta, L, H)
+                a_i_new = a_i_old + y_[i] * y_[j] * (a_j_old - a_j_new)
+
+                delta = jnp.abs(a_j_new - a_j_old)
+                # jax.debug.print('WARNING   a_j update too small, delta = {}', delta)
+                cond(delta < 1e-5, lambda delta: print_delta_too_small(delta), pass_it, delta)
+                # if jnp.abs(a_j_new - a_j_old) < tol:
+                #     print(f'WARNING   a_j update too small, delta = {a_j_new - a_j_old}')
+                #     continue
+
+                # alpha[i], alpha[j] = a_i_new, a_j_new
+                alpha = alpha.at[i].set(a_i_new)
+                alpha = alpha.at[j].set(a_j_new)
+
+                b_i = -E_i - y_[i] * kernel_map(x_[i], x_[i], kernel) * (a_i_new - a_i_old) - \
+                      y_[j] * kernel_map(x_[i], x_[j], kernel) * (a_j_new - a_j_old) + b
+                b_j = -E_j - y_[i] * kernel_map(x_[i], x_[j], kernel) * (a_i_new - a_i_old) - \
+                      y_[j] * kernel_map(x_[j], x_[j], kernel) * (a_j_new - a_j_old) + b
+                # if 0 < a_i_new < c:
+                #     b = b_i
+                # elif 0 < a_j_new < c:
+                #     b = b_j
+                # else:
+                #     b = (b_i + b_j) / 2
+
+                b = cond(jax.lax.bitwise_and(0 < a_i_new, a_i_new < c), lambda a_j_new, b_i, b_j, c: b_i,
+                         lambda a_j_new, b_i, b_j, c: cond(jax.lax.bitwise_and(0 < a_j_new, a_j_new < c),
+                                                           lambda a_j_new, b_i, b_j, c: b_j,
+                                                           lambda a_j_new, b_i, b_j, c: (b_i + b_j) / 2, a_j_new, b_i,
+                                                           b_j,
+                                                           c), a_j_new, b_i, b_j, c)
+
+                num_changed_alphas += 1
+                jax.debug.print('\033[0m INFO   iteration:{}  i:{}  pair_changed:{}', passes, i,
+                                num_changed_alphas)
+                return i, n, alpha, b, passes, num_changed_alphas
+
+            cond(eta <= 0, print_eta_le_0, if_brunch, i, n, alpha, b, passes, num_changed_alphas)
+
             # if eta <= 0:
             #     print('WARNING  eta <= 0')
             #     continue
-
-            a_i_old, a_j_old = alpha[i], alpha[j]
-
-            L, H = cond(y_[i] == y_[j], lambda a_j_old, a_i_old, c: (
-                jnp.maximum(0, a_j_old + a_i_old - c), jnp.minimum(c, a_j_old + a_i_old)), lambda a_j_old, a_i_old, c: (
-                jnp.maximum(0, a_j_old - a_i_old), jnp.minimum(c, c + a_j_old - a_i_old)), a_j_old, a_i_old, c)
-
-            # if y_[i] == y_[j]:
-            #     L = jnp.maximum(0, a_j_old + a_i_old - c)
-            #     H = jnp.minimum(c, a_j_old + a_i_old)
-            # else:
-            #     L = jnp.maximum(0, a_j_old - a_i_old)
-            #     H = jnp.minimum(c, c + a_j_old - a_i_old)
-
-            a_j_new = jnp.clip(a_j_old + y_[j] * (E_i - E_j) / eta, L, H)
-            a_i_new = a_i_old + y_[i] * y_[j] * (a_j_old - a_j_new)
-
-            delta = jnp.abs(a_j_new - a_j_old)
-            cond(delta < 1e-5, lambda delta: print_delta_too_small(delta), pass_it, delta)
-            # if jnp.abs(a_j_new - a_j_old) < tol:
-            #     print(f'WARNING   a_j update too small, delta = {a_j_new - a_j_old}')
-            #     continue
-
-            # alpha[i], alpha[j] = a_i_new, a_j_new
-            alpha = alpha.at[i].set(a_i_new)
-            alpha = alpha.at[j].set(a_j_new)
-
-            b_i = -E_i - y_[i] * kernel_map(x_[i], x_[i], kernel) * (a_i_new - a_i_old) - \
-                  y_[j] * kernel_map(x_[i], x_[j], kernel) * (a_j_new - a_j_old) + b
-            b_j = -E_j - y_[i] * kernel_map(x_[i], x_[j], kernel) * (a_i_new - a_i_old) - \
-                  y_[j] * kernel_map(x_[j], x_[j], kernel) * (a_j_new - a_j_old) + b
-            # if 0 < a_i_new < c:
-            #     b = b_i
-            # elif 0 < a_j_new < c:
-            #     b = b_j
-            # else:
-            #     b = (b_i + b_j) / 2
-
-            b = cond(jax.lax.bitwise_and(0 < a_i_new, a_i_new < c), lambda a_j_new, b_i, b_j, c: b_i,
-                     lambda a_j_new, b_i, b_j, c: cond(jax.lax.bitwise_and(0 < a_j_new, a_j_new < c),
-                                                       lambda a_j_new, b_i, b_j, c: b_j,
-                                                       lambda a_j_new, b_i, b_j, c: (b_i + b_j) / 2, a_j_new, b_i, b_j,
-                                                       c), a_j_new, b_i, b_j, c)
-            passes += 1
-            print(f'INFO   iteration:{passes}  i:{i}  pair_changed:{num_changed_alphas}')
             # if num_changed_alphas == 0:
             #     passes += 1
             # else:
             #     passes = 0
 
-            passes = cond(num_changed_alphas == 0, lambda passes: passes + 1, lambda passes: 0, passes)
-            print(f'iteration number: {passes}')
+        _, alpha, b, passes, num_changed_alphas = fori_loop(0, n, lambda i, *a: for_loop_body(i, n, alpha, b, passes,
+                                                                                              num_changed_alphas),
+                                                            (n, alpha, b, passes, num_changed_alphas))
 
-            return n, alpha, b, passes, num_changed_alphas
-
-        _, alpha, b, passes, num_changed_alphas=fori_loop(0, n, lambda i, *a: for_loop_body(i, n, alpha, b, passes, num_changed_alphas),
-                  (n, alpha, b, passes, num_changed_alphas))
+        passes += 1
+        passes = cond(num_changed_alphas == 0, lambda passes: passes + 1, lambda passes: 0, passes)
+        jax.debug.print('\033[0m passes number: {}', passes)
 
         # else:
         #     continue
@@ -197,7 +206,7 @@ def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
         return [n, alpha, b, passes]
 
     _, alpha, b, _ = while_loop(lambda *a: passes < max_passes,
-                                lambda *a: loop_body(n, alpha, b, passes), [n, alpha, b, passes])
+                                lambda *a: while_loop_body(n, alpha, b, passes), [n, alpha, b, passes])
 
     return alpha, b
 
