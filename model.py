@@ -75,7 +75,7 @@ def hinge_loss(y, y_pred):
     return jnp.max(0, 1 - y * y_pred)
 
 
-def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
+def smo_jit(x_, y_, kernel, c, tol=1e-3, max_passes=5):
     r"""
     Sequential Minimal Optimization algorithm.
 
@@ -97,7 +97,7 @@ def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
 
     def print_eta_le_0(i, n, alpha, b, passes, num_changed_alphas):
         jax.debug.print('\033[1;031m WARNING  eta <= 0')
-        return i, n, alpha, b, passes, num_changed_alphas
+        return [n, alpha, b, passes, num_changed_alphas]
 
     def print_delta_too_small(delta):
         jax.debug.print('\033[1;031m WARNING   a_j update too small, delta = {}', delta)
@@ -180,9 +180,10 @@ def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
                 num_changed_alphas += 1
                 jax.debug.print('\033[0m INFO   iteration:{}  i:{}  pair_changed:{}', passes, i,
                                 num_changed_alphas)
-                return i, n, alpha, b, passes, num_changed_alphas
+                return [n, alpha, b, passes, num_changed_alphas]
 
-            cond(eta <= 0, print_eta_le_0, if_brunch, i, n, alpha, b, passes, num_changed_alphas)
+            return cond(eta <= 0, lambda a: print_eta_le_0(*a), lambda a: if_brunch(*a),
+                        [i, n, alpha, b, passes, num_changed_alphas])
 
             # if eta <= 0:
             #     print('WARNING  eta <= 0')
@@ -192,9 +193,8 @@ def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
             # else:
             #     passes = 0
 
-        _, alpha, b, passes, num_changed_alphas = fori_loop(0, n, lambda i, *a: for_loop_body(i, n, alpha, b, passes,
-                                                                                              num_changed_alphas),
-                                                            (n, alpha, b, passes, num_changed_alphas))
+        _, alpha, b, passes, num_changed_alphas = fori_loop(0, n, lambda i, a: for_loop_body(i, *a),
+                                                            [n, alpha, b, passes, num_changed_alphas])
 
         passes += 1
         passes = cond(num_changed_alphas == 0, lambda passes: passes + 1, lambda passes: 0, passes)
@@ -207,6 +207,124 @@ def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
 
     _, alpha, b, _ = while_loop(lambda *a: passes < max_passes,
                                 lambda *a: while_loop_body(n, alpha, b, passes), [n, alpha, b, passes])
+
+    return alpha, b
+
+
+def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
+    r"""
+    Sequential Minimal Optimization algorithm.
+
+    :param x_: (n, D) support vectors
+    :param y_: (n) support vector labels
+    :param kernel: (1) kernel function
+    :param c: (1) regularization parameter
+    :param tol: (1) tolerance
+    :param max_passes: (1) maximum number of passes
+    :return: (n) alpha
+    """
+    n = x_.shape[0]
+    alpha = jnp.zeros(n)
+    b = 0
+    passes = 0
+
+    _svm_forward = jit(vmap(
+        svm_forward, in_axes=(0, None, None, None, None, None)),
+        static_argnames=['kernel'])
+
+    def select_i(g_xi_, alpha_, y_, c, tol):
+        for i in range(n):
+            if 0 < alpha[_i] < c:
+                # if jnp.abs(g_xi_[i] - y_[i]) > tol:
+                if jnp.abs(g_xi_[i] * y_[i] - 1) > tol:
+                    return i
+        for i in range(n):
+            if jnp.abs(alpha[_i]) < tol:
+                if g_xi_[i] * y_[i] - 1 < 0:
+                    return i
+            if jnp.abs(alpha[_i] - c) < tol:
+                if g_xi_[i] * y_[i] - 1 > 0:
+                    return i
+
+        return -1
+
+    while passes < max_passes:
+        num_changed_alphas = 0
+        g_xi_ = _svm_forward(x_, x_, y_, alpha, b, kernel)
+        i = 0
+        for _i in range(n):
+            # g_xi = svm_forward(x_[i], kernel, x_, y_, alpha, b)
+            if 0 < alpha[_i] < c and jnp.abs(g_xi_[_i] * y_[_i] - 1.) < tol:
+                i = _i
+            else:
+                continue
+
+        print(f'i:{i}')
+
+        '''
+        E_i = g_xi_[i] - y_[i]
+                j = jax.random.randint(key, shape=(), minval=0, maxval=n)
+                if j == i:
+                    j = (j + 1) % n
+
+                # while j == i:
+                #       j = jax.random.randint(key, shape=(), minval=0, maxval=n)
+
+                if j == i and j < n - 1:
+                    j += 1
+                else:
+                    j -= 1
+
+                # g_xi = svm_forward(x_[i], kernel, x_, y_, alpha, b)
+                g_xj = svm_forward(x_[j], kernel, x_, y_, alpha, b)
+                E_j = g_xj - y_[j]
+
+                eta = kernel_map(x_[i], x_[i], kernel) + \
+                      kernel_map(x_[j], x_[j], kernel) - \
+                      2 * kernel_map(x_[i], x_[j], kernel)
+
+                if eta <= 0:
+                    print('WARNING  eta <= 0')
+                    continue
+
+                a_i_old, a_j_old = alpha[i], alpha[j]
+
+                if y_[i] == y_[j]:
+                    L = jnp.maximum(0, a_j_old + a_i_old - c)
+                    H = jnp.minimum(c, a_j_old + a_i_old)
+                else:
+                    L = jnp.maximum(0, a_j_old - a_i_old)
+                    H = jnp.minimum(c, c + a_j_old - a_i_old)
+
+                a_j_new = jnp.clip(a_j_old + y_[j] * (E_i - E_j) / eta, L, H)
+                a_i_new = a_i_old + y_[i] * y_[j] * (a_j_old - a_j_new)
+
+                if jnp.abs(a_j_new - a_j_old) < tol:
+                    print(f'WARNING   a_j update too small, delta = {a_j_new - a_j_old}')
+                    continue
+
+                alpha.at[i].set(a_i_new)
+                alpha.at[j].set(a_j_new)
+
+                b_i = -E_i - y_[i] * kernel_map(x_[i], x_[i], kernel) * (a_i_new - a_i_old) - \
+                      y_[j] * kernel_map(x_[i], x_[j], kernel) * (a_j_new - a_j_old) + b
+                b_j = -E_j - y_[i] * kernel_map(x_[i], x_[j], kernel) * (a_i_new - a_i_old) - \
+                      y_[j] * kernel_map(x_[j], x_[j], kernel) * (a_j_new - a_j_old) + b
+                if 0 < a_i_new < c:
+                    b = b_i
+                elif 0 < a_j_new < c:
+                    b = b_j
+                else:
+                    b = (b_i + b_j) / 2
+                num_changed_alphas += 1
+                print(f'INFO   iteration:{passes}  i:{i}  pair_changed:{num_changed_alphas}')
+        '''
+
+        if num_changed_alphas == 0:
+            passes += 1
+        else:
+            passes = 0
+        print(f'iteration number: {passes}')
 
     return alpha, b
 
