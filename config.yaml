@@ -1,0 +1,32 @@
+search_space:
+  c:
+    _type: uniform
+    _value: [ 0, 20 ]
+  gamma:
+    _type: loguniform
+    _value: [ 1e-10, 10 ]
+  momentum:
+    _type: uniform
+    _value: [ 0, 1 ]
+
+nni_manager_ip: 192.168.0.114
+trial_command: python train_np.py
+trial_code_directory: .
+max_trial_number: 512
+trial_concurrency: 16
+tuner:
+  name: TPE
+  classArgs:
+    optimize_mode: maximize
+trainingService:
+  platform: remote
+  machineList:
+    - host: 192.168.0.100
+      pythonPath: /Users/songqi/opt/anaconda3/envs/svm/bin
+      user: songqi
+      password: Aa7474741
+    - host: 192.168.0.114
+      user: songqi
+      password: Aa7474741
+      pythonPath: /home/songqi/miniconda3/envs/svm/bin
+

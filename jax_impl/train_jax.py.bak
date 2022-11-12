@@ -1,11 +1,10 @@
-import model
-import kernels
-import mertics
+import model_jax
+import kernels_jax
+import mertics_jax
 import jax
-import torch
 
 from jax import numpy as jnp
-from jax import grad, jit, vmap
+from jax import jit, vmap
 
 key = jax.random.PRNGKey(0)
 

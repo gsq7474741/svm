@@ -5,7 +5,7 @@ from typing import Literal
 from jax import numpy as jnp
 from jax.lax import while_loop, cond, fori_loop, switch
 from jax import grad, jit, vmap
-from kernels import kernel_map, linear_kernel, polynomial_kernel, rbf_kernel
+from kernels_jax import kernel_map, linear_kernel, polynomial_kernel, rbf_kernel
 
 key = jax.random.PRNGKey(0)
 
@@ -227,98 +227,173 @@ def smo(x_, y_, kernel, c, tol=1e-3, max_passes=5):
     alpha = jnp.zeros(n)
     b = 0
     passes = 0
+    refused_i = []
+    refused_j = []
 
     _svm_forward = jit(vmap(
         svm_forward, in_axes=(0, None, None, None, None, None)),
         static_argnames=['kernel'])
 
-    def select_i(g_xi_, alpha_, y_, c, tol):
+    def select_i(g_xi_, alpha, y_, c, tol):
         for i in range(n):
-            if 0 < alpha[_i] < c:
+            if 0 < alpha[i] < c:
                 # if jnp.abs(g_xi_[i] - y_[i]) > tol:
                 if jnp.abs(g_xi_[i] * y_[i] - 1) > tol:
                     return i
         for i in range(n):
-            if jnp.abs(alpha[_i]) < tol:
+            if jnp.abs(alpha[i]) < tol:
                 if g_xi_[i] * y_[i] - 1 < 0:
                     return i
-            if jnp.abs(alpha[_i] - c) < tol:
+            if jnp.abs(alpha[i] - c) < tol:
                 if g_xi_[i] * y_[i] - 1 > 0:
                     return i
 
         return -1
 
+    def _eta(x_i, x_j, kernel):
+        return kernel_map(x_i, x_i, kernel) + kernel_map(x_j, x_j, kernel) - 2 * kernel_map(x_i, x_j, kernel)
+
+    def select_j(E_i, i, x_, y_):
+        j = jnp.argmax(jnp.abs(E_i[i] - E_i))
+        if _eta(x_[i], x_[j], kernel) <= 0:
+            for j in range(n):
+                if 0 < alpha[j] < c:
+                    if _eta(x_[i], x_[j], kernel) > 0:
+                        return j
+            for j in range(n):
+                if _eta(x_[i], x_[j], kernel) > 0:
+                    return j
+            return -1
+        return j
+
+    def select_ij(g_x_, alpha, y_, c, tol):
+        # skip = False
+        i, j = -1, -1
+        while True:
+            i = select_i(g_x_, alpha, y_, c, tol)
+            if i == -1:
+                # skip = True
+                break
+
+            E_ = g_x_ - y_
+            j = select_j(E_, i, x_, y_)
+            if j != -1 and (i, j) not in zip(refused_i, refused_j):
+                break
+        return i, j
+
+    def calc_a(i, j, g_x_):
+        while True:
+
+            print(f'i:{i}   j:{j}')
+
+            # j = jax.random.randint(key, shape=(), minval=0, maxval=n)
+            # if j == i:
+            #     j = (j + 1) % n
+
+            # while j == i:
+            #       j = jax.random.randint(key, shape=(), minval=0, maxval=n)
+
+            # if j == i and j < n - 1:
+            #     j += 1
+            # else:
+            #     j -= 1
+
+            # g_xi = svm_forward(x_[i], kernel, x_, y_, alpha, b)
+            # g_xj = svm_forward(x_[j], kernel, x_, y_, alpha, b)
+            # E_j = g_xj - y_[j]
+
+            eta = kernel_map(x_[i], x_[i], kernel) + \
+                  kernel_map(x_[j], x_[j], kernel) - \
+                  2 * kernel_map(x_[i], x_[j], kernel)
+
+            # if eta <= 0:
+            #     print('WARNING  eta <= 0')
+            #     continue
+
+            if y_[i] == y_[j]:
+                L = jnp.maximum(0, a_j_old + a_i_old - c)
+                H = jnp.minimum(c, a_j_old + a_i_old)
+            else:
+                L = jnp.maximum(0, a_j_old - a_i_old)
+                H = jnp.minimum(c, c + a_j_old - a_i_old)
+
+            a_j_new = jnp.clip(a_j_old + y_[j] * (E_[i] - E_[j]) / eta, L, H)
+            a_i_new = a_i_old + y_[i] * y_[j] * (a_j_old - a_j_new)
+
+            # if jnp.abs(a_j_new - a_j_old) < tol:
+            #     print(f'WARNING   a_j update too small, delta = {a_j_new - a_j_old}')
+            #     refused_j.append(int(j))
+            #     i,j=select_ij(g_x_, alpha, y_, c, tol)
+            #     if len(set(refused_j)) == n:
+            #         # refused_j = []
+            #         return None, None
+            #     continue
+            # else:
+            #     return a_i_new, a_j_new
+
     while passes < max_passes:
         num_changed_alphas = 0
-        g_xi_ = _svm_forward(x_, x_, y_, alpha, b, kernel)
+        # svm_forward(x, kernel: int, x_, y_, alpha, b):
+        g_x_ = _svm_forward(x_, kernel, x_, y_, alpha, b)
         i = 0
-        for _i in range(n):
-            # g_xi = svm_forward(x_[i], kernel, x_, y_, alpha, b)
-            if 0 < alpha[_i] < c and jnp.abs(g_xi_[_i] * y_[_i] - 1.) < tol:
-                i = _i
-            else:
+        # for _i in range(n):
+        # # g_xi = svm_forward(x_[i], kernel, x_, y_, alpha, b)
+        # if 0 < alpha[_i] < c and jnp.abs(g_xi_[_i] * y_[_i] - 1.) < tol:
+        #     i = _i
+        # else:
+        #     continue
+
+        i, j = select_ij(g_x_, alpha, y_, c, tol)
+
+        # while True:
+        #     i = select_i(g_x_, alpha, y_, c, tol)
+        #     if i == -1:
+        #         skip = True
+        #         break
+        #
+        #     E_ = g_x_ - y_
+        #     j = select_j(E_, i, x_, y_)
+        #     if j != -1:
+        #         break
+
+        if i == -1:
+            # refused_i
+            passes += 1
+            continue
+        E_ = g_x_ - y_
+        a_i_old, a_j_old = alpha[i], alpha[j]
+        while True:
+
+            a_i_new, a_j_new = calc_a(i, j, g_x_)
+            if jnp.abs(a_j_new - a_j_old) < tol:
+                print(f'WARNING   a_j update too small, delta = {a_j_new - a_j_old}')
+                refused_j.append(int(j))
+                i,j=select_ij(g_x_, alpha, y_, c, tol)
+                if len(set(refused_j)) == n:
+                    # refused_j = []
+                    return None, None
+                continue
+            if a_i_new is None:
+                refused_i.append(i)
                 continue
 
-        print(f'i:{i}')
+        alpha = alpha.at[i].set(a_i_new)
+        alpha = alpha.at[j].set(a_j_new)
+        refused_i.clear()
+        refused_j.clear()
 
-        '''
-        E_i = g_xi_[i] - y_[i]
-                j = jax.random.randint(key, shape=(), minval=0, maxval=n)
-                if j == i:
-                    j = (j + 1) % n
-
-                # while j == i:
-                #       j = jax.random.randint(key, shape=(), minval=0, maxval=n)
-
-                if j == i and j < n - 1:
-                    j += 1
-                else:
-                    j -= 1
-
-                # g_xi = svm_forward(x_[i], kernel, x_, y_, alpha, b)
-                g_xj = svm_forward(x_[j], kernel, x_, y_, alpha, b)
-                E_j = g_xj - y_[j]
-
-                eta = kernel_map(x_[i], x_[i], kernel) + \
-                      kernel_map(x_[j], x_[j], kernel) - \
-                      2 * kernel_map(x_[i], x_[j], kernel)
-
-                if eta <= 0:
-                    print('WARNING  eta <= 0')
-                    continue
-
-                a_i_old, a_j_old = alpha[i], alpha[j]
-
-                if y_[i] == y_[j]:
-                    L = jnp.maximum(0, a_j_old + a_i_old - c)
-                    H = jnp.minimum(c, a_j_old + a_i_old)
-                else:
-                    L = jnp.maximum(0, a_j_old - a_i_old)
-                    H = jnp.minimum(c, c + a_j_old - a_i_old)
-
-                a_j_new = jnp.clip(a_j_old + y_[j] * (E_i - E_j) / eta, L, H)
-                a_i_new = a_i_old + y_[i] * y_[j] * (a_j_old - a_j_new)
-
-                if jnp.abs(a_j_new - a_j_old) < tol:
-                    print(f'WARNING   a_j update too small, delta = {a_j_new - a_j_old}')
-                    continue
-
-                alpha.at[i].set(a_i_new)
-                alpha.at[j].set(a_j_new)
-
-                b_i = -E_i - y_[i] * kernel_map(x_[i], x_[i], kernel) * (a_i_new - a_i_old) - \
-                      y_[j] * kernel_map(x_[i], x_[j], kernel) * (a_j_new - a_j_old) + b
-                b_j = -E_j - y_[i] * kernel_map(x_[i], x_[j], kernel) * (a_i_new - a_i_old) - \
-                      y_[j] * kernel_map(x_[j], x_[j], kernel) * (a_j_new - a_j_old) + b
-                if 0 < a_i_new < c:
-                    b = b_i
-                elif 0 < a_j_new < c:
-                    b = b_j
-                else:
-                    b = (b_i + b_j) / 2
-                num_changed_alphas += 1
-                print(f'INFO   iteration:{passes}  i:{i}  pair_changed:{num_changed_alphas}')
-        '''
+        b_i = -E_[i] - y_[i] * kernel_map(x_[i], x_[i], kernel) * (a_i_new - a_i_old) - \
+              y_[j] * kernel_map(x_[i], x_[j], kernel) * (a_j_new - a_j_old) + b
+        b_j = -E_[j] - y_[i] * kernel_map(x_[i], x_[j], kernel) * (a_i_new - a_i_old) - \
+              y_[j] * kernel_map(x_[j], x_[j], kernel) * (a_j_new - a_j_old) + b
+        if 0 < a_i_new < c:
+            b = b_i
+        elif 0 < a_j_new < c:
+            b = b_j
+        else:
+            b = (b_i + b_j) / 2
+        num_changed_alphas += 1
+        print(f'INFO   iteration:{passes}  i:{i}  pair_changed:{num_changed_alphas}')
 
         if num_changed_alphas == 0:
             passes += 1
